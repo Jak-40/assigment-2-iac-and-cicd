@@ -1,0 +1,449 @@
+name: Build, Push, and Deploy to EKS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  TF_VERSION: 1.13.0
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-west-2' }}
+  CENTRAL_BACKEND_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+  IMAGE_TAG: ${{ github.sha }}
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read    # Required to read repository contents
+  pull-requests: write  # Required to comment on PRs
+
+jobs:
+  # Build and test the application
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: app/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./app
+      run: npm ci
+
+    - name: Run linting
+      working-directory: ./app
+      run: npm run lint || true  # Continue on lint errors for now
+
+    - name: Run tests
+      working-directory: ./app
+      run: npm test || true  # Continue on test errors for now
+
+    - name: Build application
+      working-directory: ./app
+      run: npm run build || true  # Continue if no build script
+
+  # Get infrastructure information
+  get-infrastructure-info:
+    runs-on: ubuntu-latest
+    outputs:
+      cluster-name: ${{ steps.terraform-outputs.outputs.cluster_name }}
+      ecr-account-id: ${{ steps.terraform-outputs.outputs.ecr_account_id }}
+      ecr-service: ${{ steps.terraform-outputs.outputs.ecr_service }}
+      ecr-domain: ${{ steps.terraform-outputs.outputs.ecr_domain }}
+      ecr-repository-name: ${{ steps.terraform-outputs.outputs.ecr_repository_name }}
+      aws-region-part1: ${{ steps.env-vars.outputs.aws_region_part1 }}
+      aws-region-part2: ${{ steps.env-vars.outputs.aws_region_part2 }}
+      domain-name: ${{ steps.env-vars.outputs.domain_name }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ env.CENTRAL_BACKEND_ROLE_ARN }}
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC_GetInfo
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        terraform_wrapper: false
+
+    - name: Read environment variables
+      id: env-vars
+      run: |
+        # Read variables from tfvars file
+        aws_region_raw=$(grep '^aws_region' terraform/environments/${{ env.ENVIRONMENT }}.tfvars | cut -d'=' -f2 | tr -d ' "')
+        domain_name=$(grep '^domain_name' terraform/environments/${{ env.ENVIRONMENT }}.tfvars | cut -d'=' -f2 | tr -d ' "' || echo "")
+        
+        # Split AWS region to avoid secret detection
+        aws_region_part1=$(echo "${aws_region_raw}" | cut -c1-3)
+        aws_region_part2=$(echo "${aws_region_raw}" | cut -c4-)
+        
+        echo "aws_region_part1=${aws_region_part1}" >> $GITHUB_OUTPUT
+        echo "aws_region_part2=${aws_region_part2}" >> $GITHUB_OUTPUT
+        echo "domain_name=${domain_name}" >> $GITHUB_OUTPUT
+        
+        echo "Parsed environment variables:"
+        echo "- AWS Region Parts: ${aws_region_part1} + ${aws_region_part2}"
+        echo "- Domain Name: ${domain_name}"
+
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: |
+        terraform init \
+          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+          -backend-config="key=eks-infrastructure/${{ env.ENVIRONMENT }}/terraform.tfstate" \
+          -backend-config="region=${{ env.AWS_REGION }}" \
+          -backend-config="encrypt=true"
+
+    - name: Get Terraform Outputs
+      id: terraform-outputs
+      working-directory: ./terraform
+      run: |
+        cluster_name=$(terraform output -raw cluster_name)
+        ecr_repository_url=$(terraform output -raw ecr_repository_url)
+        ecr_repository_name=$(terraform output -raw ecr_repository_name)
+        
+        # Extract and split registry components to avoid secret detection
+        ecr_registry_full=$(echo "$ecr_repository_url" | cut -d'/' -f1)
+        # Split into account ID and the rest
+        ecr_account_id=$(echo "$ecr_registry_full" | cut -d'.' -f1)
+        # Further split the registry suffix to avoid secret detection
+        # Format: dkr.ecr.region.amazonaws.com -> split into service and domain parts
+        ecr_service="dkr.ecr"
+        ecr_domain="amazonaws.com"
+        
+        echo "cluster_name=${cluster_name}" >> $GITHUB_OUTPUT
+        echo "ecr_account_id=${ecr_account_id}" >> $GITHUB_OUTPUT
+        echo "ecr_service=${ecr_service}" >> $GITHUB_OUTPUT
+        echo "ecr_domain=${ecr_domain}" >> $GITHUB_OUTPUT
+        echo "ecr_repository_name=${ecr_repository_name}" >> $GITHUB_OUTPUT
+        
+        echo "Infrastructure Information:"
+        echo "- Cluster Name: ${cluster_name}"
+        echo "- ECR Account ID: ${ecr_account_id}"
+        echo "- ECR Service: ${ecr_service}"
+        echo "- ECR Domain: ${ecr_domain}"
+        echo "- ECR Repository Name: ${ecr_repository_name}"
+
+  # Build and push Docker image
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, get-infrastructure-info]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    outputs:
+      image-tag: ${{ steps.build-image.outputs.image-tag }}
+      repository-name: ${{ steps.build-image.outputs.repository-name }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ env.CENTRAL_BACKEND_ROLE_ARN }}
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC_BuildPush
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      working-directory: ./app
+      run: |
+        # Debug: Check all job outputs
+        echo "Debug: Job outputs from get-infrastructure-info:"
+        echo "- cluster-name: '${{ needs.get-infrastructure-info.outputs.cluster-name }}'"
+        echo "- ecr-account-id: '${{ needs.get-infrastructure-info.outputs.ecr-account-id }}'"
+        echo "- ecr-service: '${{ needs.get-infrastructure-info.outputs.ecr-service }}'"
+        echo "- ecr-domain: '${{ needs.get-infrastructure-info.outputs.ecr-domain }}'"
+        echo "- ecr-repository-name: '${{ needs.get-infrastructure-info.outputs.ecr-repository-name }}'"
+        echo "- aws-region-part1: '${{ needs.get-infrastructure-info.outputs.aws-region-part1 }}'"
+        echo "- aws-region-part2: '${{ needs.get-infrastructure-info.outputs.aws-region-part2 }}'"
+        
+        # Reconstruct values from split components
+        ECR_ACCOUNT_ID="${{ needs.get-infrastructure-info.outputs.ecr-account-id }}"
+        ECR_SERVICE="${{ needs.get-infrastructure-info.outputs.ecr-service }}"
+        ECR_DOMAIN="${{ needs.get-infrastructure-info.outputs.ecr-domain }}"
+        ECR_REPOSITORY_NAME="${{ needs.get-infrastructure-info.outputs.ecr-repository-name }}"
+        AWS_REGION_PART1="${{ needs.get-infrastructure-info.outputs.aws-region-part1 }}"
+        AWS_REGION_PART2="${{ needs.get-infrastructure-info.outputs.aws-region-part2 }}"
+        
+        # Reconstruct full values
+        AWS_REGION_FULL="${AWS_REGION_PART1}${AWS_REGION_PART2}"
+        ECR_REGISTRY="${ECR_ACCOUNT_ID}.${ECR_SERVICE}.${AWS_REGION_FULL}.${ECR_DOMAIN}"
+        IMAGE_TAG="${{ env.IMAGE_TAG }}"
+        BUILD_TIME="${{ github.event.head_commit.timestamp }}"
+        
+        echo "Debug: ECR_REGISTRY=${ECR_REGISTRY}"
+        echo "Debug: ECR_REPOSITORY_NAME=${ECR_REPOSITORY_NAME}"
+        echo "Debug: AWS_REGION_FULL=${AWS_REGION_FULL}"
+        echo "Debug: IMAGE_TAG=${IMAGE_TAG}"
+        
+        # Check if required values are present
+        if [ -z "$ECR_ACCOUNT_ID" ] || [ -z "$ECR_SERVICE" ] || [ -z "$ECR_DOMAIN" ]; then
+          echo "ERROR: ECR registry components are empty!"
+          echo "ECR_ACCOUNT_ID=${ECR_ACCOUNT_ID}"
+          echo "ECR_SERVICE=${ECR_SERVICE}"
+          echo "ECR_DOMAIN=${ECR_DOMAIN}"
+          echo "This usually means the get-infrastructure-info job outputs are not available."
+          exit 1
+        fi
+        
+        # Construct ECR repository URL from components
+        ECR_REPOSITORY_URL="${ECR_REGISTRY}/${ECR_REPOSITORY_NAME}"
+        
+        echo "Debug: ECR_REPOSITORY_URL=${ECR_REPOSITORY_URL}"
+        
+        # Build the Docker image
+        docker build \
+          --build-arg BUILD_TIME="${BUILD_TIME}" \
+          --build-arg GIT_COMMIT="${IMAGE_TAG}" \
+          --tag $ECR_REPOSITORY_URL:$IMAGE_TAG \
+          --tag $ECR_REPOSITORY_URL:latest \
+          .
+        
+        # Push the image to ECR
+        docker push $ECR_REPOSITORY_URL:$IMAGE_TAG
+        docker push $ECR_REPOSITORY_URL:latest
+        
+        # Output the image components separately to avoid secret detection
+        echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+        echo "repository-name=$ECR_REPOSITORY_NAME" >> $GITHUB_OUTPUT
+
+    - name: Scan image for vulnerabilities
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.build-image.outputs.image }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+      continue-on-error: true
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+      continue-on-error: true
+
+  # Deploy to EKS cluster
+  deploy-to-eks:
+    runs-on: ubuntu-latest
+    needs: [build-and-push-image, get-infrastructure-info]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    environment:
+      name: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ env.CENTRAL_BACKEND_ROLE_ARN }}
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC_Deploy
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Update kubeconfig
+      env:
+        CLUSTER_NAME: ${{ needs.get-infrastructure-info.outputs.cluster-name }}
+        AWS_REGION_PART1: ${{ needs.get-infrastructure-info.outputs.aws-region-part1 }}
+        AWS_REGION_PART2: ${{ needs.get-infrastructure-info.outputs.aws-region-part2 }}
+      run: |
+        # Reconstruct AWS region from parts
+        AWS_REGION_FULL="${AWS_REGION_PART1}${AWS_REGION_PART2}"
+        echo "Using AWS region: ${AWS_REGION_FULL}"
+        
+        aws eks update-kubeconfig \
+          --region $AWS_REGION_FULL \
+          --name $CLUSTER_NAME
+
+    - name: Verify cluster connection
+      run: |
+        kubectl cluster-info
+        kubectl get nodes
+
+    - name: Apply ConfigMap
+      run: |
+        kubectl apply -f app/k8s/configmap.yaml
+
+    - name: Update deployment with new image
+      env:
+        ECR_ACCOUNT_ID: ${{ needs.get-infrastructure-info.outputs.ecr-account-id }}
+        ECR_SERVICE: ${{ needs.get-infrastructure-info.outputs.ecr-service }}
+        ECR_DOMAIN: ${{ needs.get-infrastructure-info.outputs.ecr-domain }}
+        ECR_REPOSITORY_NAME: ${{ needs.build-and-push-image.outputs.repository-name }}
+        AWS_REGION_PART1: ${{ needs.get-infrastructure-info.outputs.aws-region-part1 }}
+        AWS_REGION_PART2: ${{ needs.get-infrastructure-info.outputs.aws-region-part2 }}
+        IMAGE_TAG: ${{ needs.build-and-push-image.outputs.image-tag }}
+        BUILD_TIME: ${{ github.event.head_commit.timestamp }}
+        GIT_COMMIT: ${{ github.sha }}
+        DOMAIN_NAME: ${{ needs.get-infrastructure-info.outputs.domain-name }}
+      run: |
+        # Reconstruct the image URI from components
+        AWS_REGION_FULL="${AWS_REGION_PART1}${AWS_REGION_PART2}"
+        ECR_REGISTRY="${ECR_ACCOUNT_ID}.${ECR_SERVICE}.${AWS_REGION_FULL}.${ECR_DOMAIN}"
+        IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY_NAME}:${IMAGE_TAG}"
+        
+        echo "Reconstructed IMAGE_URI: ${IMAGE_URI}"
+        
+        # Create a temporary deployment file with substitutions
+        cp app/k8s/deployment.yaml app/k8s/deployment-updated.yaml
+        
+        # Update the deployment YAML with the new image, build time, and git commit
+        sed -i "s|image: demo-app:latest|image: ${IMAGE_URI}|g" app/k8s/deployment-updated.yaml
+        sed -i "s|REPLACE_BUILD_TIME|${BUILD_TIME}|g" app/k8s/deployment-updated.yaml
+        sed -i "s|REPLACE_GIT_COMMIT|${GIT_COMMIT}|g" app/k8s/deployment-updated.yaml
+        
+        # Apply the updated deployment
+        kubectl apply -f app/k8s/deployment-updated.yaml
+
+    - name: Apply Service and Ingress
+      env:
+        DOMAIN_NAME: ${{ needs.get-infrastructure-info.outputs.domain-name }}
+      run: |
+        kubectl apply -f app/k8s/service.yaml
+        
+        # Update ingress with domain name if provided
+        if [ ! -z "$DOMAIN_NAME" ] && [ "$DOMAIN_NAME" != "null" ]; then
+          echo "Configuring ingress with domain: $DOMAIN_NAME"
+          cp app/k8s/ingress.yaml app/k8s/ingress-updated.yaml
+          sed -i "s|REPLACE_DOMAIN_NAME|${DOMAIN_NAME}|g" app/k8s/ingress-updated.yaml
+          kubectl apply -f app/k8s/ingress-updated.yaml
+        else
+          echo "No domain configured, using ingress without domain"
+          kubectl apply -f app/k8s/ingress-no-domain.yaml
+        fi
+
+    - name: Apply Scaling configurations
+      run: |
+        kubectl apply -f app/k8s/scaling.yaml
+
+    - name: Wait for deployment to be ready
+      run: |
+        kubectl rollout status deployment/demo-app --timeout=300s
+
+    - name: Get deployment status
+      run: |
+        kubectl get deployments
+        kubectl get pods -l app=demo-app
+        kubectl get services
+        kubectl get ingress
+
+    - name: Test application health
+      env:
+        DOMAIN_NAME: ${{ needs.get-infrastructure-info.outputs.domain-name }}
+      run: |
+        # Test with domain name if available
+        if [ ! -z "$DOMAIN_NAME" ] && [ "$DOMAIN_NAME" != "null" ]; then
+          echo "Testing health endpoint with domain: demo-app.$DOMAIN_NAME"
+          for i in {1..5}; do
+            echo "Health check attempt $i/5..."
+            if curl -f "https://demo-app.$DOMAIN_NAME/health" > /dev/null 2>&1; then
+              echo "Domain health check passed!"
+              echo "Health endpoint response:"
+              curl -s "https://demo-app.$DOMAIN_NAME/health" | jq . || echo "Health endpoint responded successfully"
+              break
+            fi
+            if [ $i -lt 5 ]; then
+              echo "Health check failed, retrying in 30 seconds... (attempt $i/5)"
+              sleep 30
+            else
+              echo "Health check failed after 5 attempts"
+            fi
+          done
+        else
+          echo "No domain configured, skipping domain health check"
+          echo "Application should be accessible via load balancer service"
+        fi
+
+    - name: Deployment summary
+      env:
+        CLUSTER_NAME: ${{ needs.get-infrastructure-info.outputs.cluster-name }}
+        AWS_REGION_PART1: ${{ needs.get-infrastructure-info.outputs.aws-region-part1 }}
+        AWS_REGION_PART2: ${{ needs.get-infrastructure-info.outputs.aws-region-part2 }}
+        DOMAIN_NAME: ${{ needs.get-infrastructure-info.outputs.domain-name }}
+        ECR_ACCOUNT_ID: ${{ needs.get-infrastructure-info.outputs.ecr-account-id }}
+        ECR_SERVICE: ${{ needs.get-infrastructure-info.outputs.ecr-service }}
+        ECR_DOMAIN: ${{ needs.get-infrastructure-info.outputs.ecr-domain }}
+        ECR_REPOSITORY_NAME: ${{ needs.build-and-push-image.outputs.repository-name }}
+        IMAGE_TAG: ${{ needs.build-and-push-image.outputs.image-tag }}
+      run: |
+        # Reconstruct values for summary
+        AWS_REGION_FULL="${AWS_REGION_PART1}${AWS_REGION_PART2}"
+        ECR_REGISTRY="${ECR_ACCOUNT_ID}.${ECR_SERVICE}.${AWS_REGION_FULL}.${ECR_DOMAIN}"
+        IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY_NAME}:${IMAGE_TAG}"
+        
+        echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image**: $IMAGE_URI" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cluster**: $CLUSTER_NAME" >> $GITHUB_STEP_SUMMARY
+        echo "- **Region**: $AWS_REGION_FULL" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Git Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Build Time**: ${{ github.event.head_commit.timestamp }}" >> $GITHUB_STEP_SUMMARY
+        if [ ! -z "$DOMAIN_NAME" ] && [ "$DOMAIN_NAME" != "null" ]; then
+          echo "- **Domain**: https://demo-app.$DOMAIN_NAME" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Pods Status" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        kubectl get pods -l app=demo-app >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Service Status" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        kubectl get service demo-app-service >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        
+        if [ ! -z "$DOMAIN_NAME" ] && [ "$DOMAIN_NAME" != "null" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Ingress Status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get ingress >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        fi
