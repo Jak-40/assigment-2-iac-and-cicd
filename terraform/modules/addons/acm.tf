@@ -19,6 +19,8 @@ resource "aws_acm_certificate" "main" {
     create_before_destroy = true
   }
 
+  depends_on = [helm_release.aws_load_balancer_controller]
+
   tags = merge(var.tags, {
     Name = "${var.cluster_name}-certificate"
     Type = "wildcard"
