@@ -49,6 +49,18 @@ variable "external_dns_version" {
   default     = "1.14.5"
 }
 
+variable "enable_metrics_server" {
+  description = "Enable Kubernetes Metrics Server addon"
+  type        = bool
+  default     = true
+}
+
+variable "metrics_server_version" {
+  description = "Version of the Kubernetes Metrics Server addon"
+  type        = string
+  default     = "v0.7.2"
+}
+
 variable "tags" {
   description = "Tags to apply to resources"
   type        = map(string)

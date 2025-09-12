@@ -36,3 +36,21 @@ additional_tags = {
   CreatedBy = "terraform"
   CostCenter = "engineering"
 }
+
+# EKS Addons Configuration
+enable_addons = true
+
+# Metrics Server Configuration
+enable_metrics_server = true
+
+# Domain Configuration (optional - uncomment and configure for cert-manager and external-dns)
+# domain_name = "your-domain.com"
+# certificate_email = "your-email@example.com"
+
+# Addon Versions (optional - defaults will be used if not specified)
+# aws_load_balancer_controller_version = "1.8.1"
+# external_dns_version = "1.14.5"
+
+# AWS Auth Configuration for EKS access (configure these with your actual ARNs)
+# ci_cd_role_arn = "arn:aws:iam::YOUR-ACCOUNT-ID:role/GitHubActionsEKSDeploymentRole"
+# local_user_arn = "arn:aws:iam::YOUR-ACCOUNT-ID:user/YourUsername"

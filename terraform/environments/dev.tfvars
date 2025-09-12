@@ -46,6 +46,9 @@ certificate_email = "novairis@gmail.com"
 aws_load_balancer_controller_version = "1.8.1"
 external_dns_version                 = "1.14.5"
 
+# Metrics Server Configuration
+enable_metrics_server = true
+
 # AWS Auth Configuration for EKS access
 ci_cd_role_arn = "arn:aws:iam::940495689171:role/GitHubActionsEKSDeploymentRole"
 local_user_arn = "arn:aws:iam::940495689171:user/Learner"

@@ -150,6 +150,18 @@ variable "external_dns_version" {
   default     = "1.14.5"
 }
 
+variable "enable_metrics_server" {
+  description = "Enable Kubernetes Metrics Server addon"
+  type        = bool
+  default     = true
+}
+
+variable "metrics_server_version" {
+  description = "Version of the Kubernetes Metrics Server addon"
+  type        = string
+  default     = null
+}
+
 # AWS Auth Configuration
 variable "ci_cd_role_arn" {
   description = "IAM Role ARN for CI/CD (GitHub Actions) access to EKS"

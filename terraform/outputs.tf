@@ -92,3 +92,19 @@ output "acm_certificate_status" {
   value       = var.enable_addons ? module.addons[0].acm_certificate_status : null
 }
 
+# Metrics Server addon outputs (only when addons are enabled)
+output "metrics_server_addon_arn" {
+  description = "ARN of the Metrics Server addon"
+  value       = var.enable_addons ? module.addons[0].metrics_server_addon_arn : null
+}
+
+output "metrics_server_addon_version" {
+  description = "Version of the Metrics Server addon"
+  value       = var.enable_addons ? module.addons[0].metrics_server_addon_version : null
+}
+
+output "metrics_server_addon_status" {
+  description = "Status of the Metrics Server addon"
+  value       = var.enable_addons ? module.addons[0].metrics_server_addon_status : null
+}
+

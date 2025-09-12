@@ -109,6 +109,10 @@ module "addons" {
   aws_load_balancer_controller_version = var.aws_load_balancer_controller_version
   external_dns_version                 = var.external_dns_version
 
+  # Metrics Server configuration
+  enable_metrics_server  = var.enable_metrics_server
+  metrics_server_version = var.metrics_server_version
+
   tags = local.common_tags
 
   depends_on = [module.eks, module.vpc]

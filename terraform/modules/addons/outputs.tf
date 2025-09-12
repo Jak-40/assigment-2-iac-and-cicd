@@ -25,3 +25,14 @@ output "acm_certificate_status" {
   description = "Status of the main ACM certificate"
   value       = var.domain_name != "" ? aws_acm_certificate.main[0].status : null
 }
+
+# Metrics Server addon outputs
+output "metrics_server_addon_arn" {
+  description = "ARN of the Metrics Server addon"
+  value       = var.enable_metrics_server ? aws_eks_addon.metrics_server[0].arn : null
+}
+
+output "metrics_server_addon_version" {
+  description = "Version of the Metrics Server addon"
+  value       = var.enable_metrics_server ? aws_eks_addon.metrics_server[0].addon_version : null
+}
