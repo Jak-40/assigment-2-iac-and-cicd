@@ -112,6 +112,8 @@ jobs:
             -out=tfplan \
             -no-color
         continue-on-error: true
+        env:
+          TF_LOG: DEBUG
 
       - name: Comment PR with Plan
         if: github.event_name == 'pull_request'

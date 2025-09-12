@@ -103,8 +103,3 @@ output "metrics_server_addon_version" {
   value       = var.enable_addons ? module.addons[0].metrics_server_addon_version : null
 }
 
-output "metrics_server_addon_status" {
-  description = "Status of the Metrics Server addon"
-  value       = var.enable_addons ? module.addons[0].metrics_server_addon_status : null
-}
-

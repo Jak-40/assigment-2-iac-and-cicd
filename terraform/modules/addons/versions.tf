@@ -12,7 +12,7 @@ terraform {
     }
     kubectl = {
       source  = "gavinbunney/kubectl"
-      version = ">= 1.14"
+      version = "1.14.0"
     }
     time = {
       source  = "hashicorp/time"
