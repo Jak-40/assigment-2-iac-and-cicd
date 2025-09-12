@@ -36,8 +36,6 @@ module "vpc" {
   single_nat_gateway   = var.single_nat_gateway
 
   tags = local.common_tags
-
-  depends_on = [module.eks, module.ecr, module.addons]
 }
 
 # ECR Module
