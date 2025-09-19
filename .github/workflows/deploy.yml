@@ -61,4 +61,137 @@ jobs:
       working-directory: ./app
       run: npm run build || true
 
-  # Get infrastructure info (kept as-is for EKS cluster, domain, repo n
+  # Get infrastructure info (kept as-is for EKS cluster, domain, repo name)
+  get-infrastructure-info:
+    runs-on: ubuntu-latest
+    outputs:
+      cluster-name: ${{ steps.terraform-outputs.outputs.cluster_name }}
+      ecr-repository-name: ${{ steps.terraform-outputs.outputs.ecr_repository_name }}
+      aws-region-part1: ${{ steps.env-vars.outputs.aws_region_part1 }}
+      aws-region-part2: ${{ steps.env-vars.outputs.aws_region_part2 }}
+      domain-name: ${{ steps.env-vars.outputs.domain_name }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ env.CENTRAL_BACKEND_ROLE_ARN }}
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC_GetInfo
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+        terraform_wrapper: false
+    - name: Read environment variables
+      id: env-vars
+      run: |
+        aws_region_raw=$(grep '^aws_region' terraform/environments/${{ env.ENVIRONMENT }}.tfvars | cut -d'=' -f2 | tr -d ' "')
+        domain_name=$(grep '^domain_name' terraform/environments/${{ env.ENVIRONMENT }}.tfvars | cut -d'=' -f2 | tr -d ' "' || echo "")
+        echo "aws_region_part1=$(echo "${aws_region_raw}" | cut -c1-3)" >> $GITHUB_OUTPUT
+        echo "aws_region_part2=$(echo "${aws_region_raw}" | cut -c4-)" >> $GITHUB_OUTPUT
+        echo "domain_name=${domain_name}" >> $GITHUB_OUTPUT
+    - name: Terraform Init
+      working-directory: ./terraform
+      run: |
+        terraform init \
+          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+          -backend-config="key=eks-infrastructure/${{ env.ENVIRONMENT }}/terraform.tfstate" \
+          -backend-config="region=${{ env.AWS_REGION }}" \
+          -backend-config="encrypt=true"
+    - name: Get Terraform Outputs
+      id: terraform-outputs
+      working-directory: ./terraform
+      run: |
+        cluster_name=$(terraform output -raw cluster_name)
+        ecr_repository_name=$(terraform output -raw ecr_repository_name)
+        echo "cluster_name=${cluster_name}" >> $GITHUB_OUTPUT
+        echo "ecr_repository_name=${ecr_repository_name}" >> $GITHUB_OUTPUT
+
+  # Build and push Docker image
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, get-infrastructure-info]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    outputs:
+      image-tag: ${{ steps.build-image.outputs.image-tag }}
+      repository-name: ${{ steps.build-image.outputs.repository-name }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ env.CENTRAL_BACKEND_ROLE_ARN }}
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC_BuildPush
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      working-directory: ./app
+      run: |
+        ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY_NAME=${{ needs.get-infrastructure-info.outputs.ecr-repository-name }}
+        IMAGE_TAG=${{ env.IMAGE_TAG }}
+        BUILD_TIME="${{ github.event.head_commit.timestamp }}"
+        
+        echo "Building image: $ECR_REGISTRY/$ECR_REPOSITORY_NAME:$IMAGE_TAG"
+        
+        docker build \
+          --build-arg BUILD_TIME="${BUILD_TIME}" \
+          --build-arg GIT_COMMIT="${IMAGE_TAG}" \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY_NAME:$IMAGE_TAG \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY_NAME:latest .
+        
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_NAME:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY_NAME:latest
+        
+        echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+        echo "repository-name=$ECR_REPOSITORY_NAME" >> $GITHUB_OUTPUT
+
+  # Deploy to EKS cluster
+  deploy-to-eks:
+    runs-on: ubuntu-latest
+    needs: [build-and-push-image, get-infrastructure-info]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ env.CENTRAL_BACKEND_ROLE_ARN }}
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC_Deploy
+        aws-region: ${{ env.AWS_REGION }}
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+    - name: Update kubeconfig
+      env:
+        CLUSTER_NAME: ${{ needs.get-infrastructure-info.outputs.cluster-name }}
+        AWS_REGION_PART1: ${{ needs.get-infrastructure-info.outputs.aws-region-part1 }}
+        AWS_REGION_PART2: ${{ needs.get-infrastructure-info.outputs.aws-region-part2 }}
+      run: |
+        AWS_REGION_FULL="${AWS_REGION_PART1}${AWS_REGION_PART2}"
+        aws eks update-kubeconfig --region $AWS_REGION_FULL --name $CLUSTER_NAME
+    - name: Update deployment with new image
+      env:
+        ECR_REGISTRY: ${{ needs.build-and-push-image.outputs.registry }}
+        ECR_REPOSITORY_NAME: ${{ needs.build-and-push-image.outputs.repository-name }}
+        IMAGE_TAG: ${{ needs.build-and-push-image.outputs.image-tag }}
+        BUILD_TIME: ${{ github.event.head_commit.timestamp }}
+        GIT_COMMIT: ${{ github.sha }}
+      run: |
+        IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY_NAME}:${IMAGE_TAG}"
+        cp app/k8s/deployment.yaml app/k8s/deployment-updated.yaml
+        sed -i "s|image: demo-app:latest|image: ${IMAGE_URI}|g" app/k8s/deployment-updated.yaml
+        sed -i "s|REPLACE_BUILD_TIME|${BUILD_TIME}|g" app/k8s/deployment-updated.yaml
+        sed -i "s|REPLACE_GIT_COMMIT|${GIT_COMMIT}|g" app/k8s/deployment-updated.yaml
+        kubectl apply -f app/k8s/deployment-updated.yaml
