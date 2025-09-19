@@ -174,7 +174,7 @@ jobs:
       with:
         role-to-assume: ${{ env.CENTRAL_BACKEND_ROLE_ARN }}
         role-session-name: GitHub_to_AWS_via_FederatedOIDC_BuildPush
-        aws-region: ${{ env.AWS_REGION }}
+        aws-region: 'us-west-2' #${{ env.AWS_REGION }}
 
     - name: Login to Amazon ECR
       id: login-ecr
